@@ -145,14 +145,14 @@ export class CellCursors {
     return this.env.active()?.table ?? null;
   }
 
-  private cell(place: Place): CursorCell | null {
-    return this.table()?.getCellAt(place.row, place.col) ?? null;
+  private cell(place: Place, table: CursorTable | null = this.table()): CursorCell | null {
+    return table?.getCellAt(place.row, place.col) ?? null;
   }
 
   private build(perLine: readonly (readonly Range[])[], primary: Place, mode: Mode, primaryRange?: Range): HeadlessHost {
-    const texts = this.places.map((place) => this.cell(place)?.text ?? "");
-    const doc = texts.join("\n");
     const active = this.env.active();
+    const texts = this.places.map((place) => this.cell(place, active?.table ?? null)?.text ?? "");
+    const doc = texts.join("\n");
     const id = active ? this.env.hostFor(active.editor.cm).id : "cells";
     const host = new HeadlessHost(
       "\n",
@@ -299,9 +299,10 @@ export class CellCursors {
       const place = this.places[Math.min(line.number - 1, this.places.length - 1)]!;
       const local = new Range(range.anchor - line.from, range.head - line.from);
       const next = runOnText(this.env.helix, line.text, "normal", local, name, null, register, null)[0] ?? local;
-      const target = isStuck(line.text, local, next, forward) ? cellNeighbor(rows, place, forward, words) : null;
+      const stuck = isStuck(line.text, local, next, forward);
+      const target = stuck ? cellNeighbor(rows, place, forward, words) : null;
       let at = place;
-      let result = isStuck(line.text, local, next, forward) ? local : next;
+      let result = stuck ? local : next;
       if (target) {
         crossed = true;
         at = target;
@@ -389,16 +390,16 @@ export class CellCursors {
     const mode = this.host.state.field(helixField).mode;
     let dirty = false;
     const doc = this.host.state.doc;
+    const table = this.table();
     this.places.forEach((place, i) => {
-      const cell = this.cell(place);
+      const cell = this.cell(place, table);
       const text = escapePipes(doc.line(i + 1).text);
       if (cell && cell.text !== text) {
-        this.table()!.updateCell(cell, text);
+        table!.updateCell(cell, text);
         dirty = true;
       }
     });
     const primary = this.primaryPlace();
-    const table = this.table();
     if (dirty && table) table.dispatchTable(primary.row, primary.col);
     else if (table) {
       const active = this.env.active();
@@ -445,14 +446,20 @@ export class CellCursors {
     const insert = value.mode === "insert";
     const shape = this.env.helix.config.cursorShape[value.mode];
     const cells: PaintCell[] = [];
+    const byLine = new Map<number, [Range, number][]>();
+    value.selection.ranges.forEach((range, r) => {
+      const number = doc.lineAt(Math.min(range.from(), doc.length)).number;
+      const own = byLine.get(number);
+      if (own) own.push([range, r]);
+      else byLine.set(number, [[range, r]]);
+    });
     this.places.forEach((place, i) => {
       if (samePlace(place, active.cell)) return;
-      const cell = this.cell(place);
+      const cell = this.cell(place, table);
       if (!cell) return;
       const line = doc.line(i + 1);
       const ranges: PaintCell["ranges"] = [];
-      value.selection.ranges.forEach((range, r) => {
-        if (doc.lineAt(Math.min(range.from(), doc.length)).number !== line.number) return;
+      (byLine.get(line.number) ?? []).forEach(([range, r]) => {
         const primary = r === value.selection.primaryIndex;
         const part = rangeParts(doc, range, primary, insert, shape);
         ranges.push({ from: part.from - line.from, to: part.to - line.from, pos: part.pos - line.from, end: part.end - line.from, eol: part.eol, primary: false });

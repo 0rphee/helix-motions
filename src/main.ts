@@ -5,7 +5,7 @@ import { buildKeymaps, commitHistoryNow, dropSelectionChange, type Config, Conte
 import { runScopeHandlers } from "@codemirror/view";
 import { deleteCharBackward, insertNewlineAndIndent } from "@codemirror/commands";
 import { makeWorkspace, leafId } from "./obsidian/workspace";
-import { releaseBar, renderStatus } from "./obsidian/status";
+import { forgetStatus, releaseBar, renderStatus } from "./obsidian/status";
 import { commentTokensAt } from "./obsidian/comments";
 import { DEFAULT_SETTINGS, HelixSettingTab, type Settings } from "./obsidian/settings";
 import { isMarkupSnap } from "./obsidian/selection-snap";
@@ -43,7 +43,7 @@ export default class HelixMotionsPlugin extends Plugin {
     this.helix = new HelixEditor(buildKeymaps(), this.baseConfig());
     this.helix.onConfigChanged = () => {
       this.applyViewConfig();
-      this.refreshStatus();
+      this.refreshStatus(true);
     };
     this.helix.visualLines = true;
     this.helix.continueLists = true;
@@ -168,7 +168,7 @@ export default class HelixMotionsPlugin extends Plugin {
       const observer = new ResizeObserver(() => {
         if (Math.abs(bar.offsetWidth - width) < 1) return;
         width = bar.offsetWidth;
-        this.refreshStatus();
+        this.refreshStatus(true);
       });
       observer.observe(bar);
       this.register(() => observer.disconnect());
@@ -198,7 +198,7 @@ export default class HelixMotionsPlugin extends Plugin {
     const workspace = this.app.workspace as unknown as { on(name: "editor-selection-change", callback: (editor: Editor) => void): EventRef };
     this.registerEvent(workspace.on("editor-selection-change", (editor) => this.countWholeFile(editor)));
     this.registerEvent(this.app.metadataCache.on("resolved", () => this.refreshStatus()));
-    this.registerEvent(this.app.workspace.on("css-change", () => window.requestAnimationFrame(() => this.refreshStatus())));
+    this.registerEvent(this.app.workspace.on("css-change", () => window.requestAnimationFrame(() => this.refreshStatus(true))));
     const onConfigFile = (file: { path: string }, oldPath?: string) => {
       if (file.path === this.configPath() || oldPath === this.configPath()) void this.reloadConfig();
     };
@@ -265,7 +265,7 @@ export default class HelixMotionsPlugin extends Plugin {
         this.helix.config = loaded.config;
         this.helix.keymaps = this.keymapsFor(loaded.keys);
         this.applyViewConfig();
-        this.refreshStatus();
+        this.refreshStatus(true);
       }
       return true;
     },
@@ -288,7 +288,7 @@ export default class HelixMotionsPlugin extends Plugin {
     this.app.workspace.updateOptions();
     this.statusEl.toggle(this.settings.enabled);
     this.activeView = this.settings.enabled ? this.api.view() : null;
-    this.refreshStatus();
+    this.refreshStatus(true);
   }
 
   private async toggleEnabled(): Promise<void> {
@@ -366,7 +366,7 @@ export default class HelixMotionsPlugin extends Plugin {
       new Notice(`Helix: ${loaded.warnings.length === 1 ? "1 warning" : `${loaded.warnings.length} warnings`} in helix.toml, see the plugin settings.`);
     }
     this.applyViewConfig();
-    this.refreshStatus();
+    this.refreshStatus(true);
   }
 
   applyViewConfig(): void {
@@ -421,14 +421,18 @@ export default class HelixMotionsPlugin extends Plugin {
       const changes: { from: number; to: number }[] = [];
       for (let i = 1; i <= doc.lines; i++) {
         const line = doc.line(i);
+        const last = line.text.charCodeAt(line.length - 1);
+        if (last > 32 && last < 127) continue;
         const m = /\p{White_Space}+$/u.exec(line.text);
         if (m) changes.push({ from: line.from + m.index, to: line.to });
       }
       if (changes.length > 0) host.dispatch({ changes });
     }
     if (config.trimFinalNewlines) {
-      const extra = (/\n+$/.exec(cm.state.doc.toString())?.[0].length ?? 0) - 1;
       const end = cm.state.doc.length;
+      let newlines = 0;
+      while (newlines < end && cm.state.doc.sliceString(end - newlines - 1, end - newlines) === "\n") newlines++;
+      const extra = newlines - 1;
       if (extra > 0) host.dispatch({ changes: { from: end - extra, to: end } });
     }
     const end = cm.state.doc.length;
@@ -477,14 +481,15 @@ export default class HelixMotionsPlugin extends Plugin {
     this.refreshStatus();
   }
 
-  refreshStatus(): void {
+  refreshStatus(force = false): void {
     if (!this.statusEl) return;
     const view = this.activeView;
     if (!view || !view.dom.isConnected || !view.state.field(helixField, false)) {
       this.statusEl.empty();
+      forgetStatus(this.statusEl);
       return;
     }
-    renderStatus(this.statusEl, this.helix, this.hostForView(view), this.viewFor({ view }));
+    renderStatus(this.statusEl, this.helix, this.hostForView(view), this.viewFor({ view }), force);
   }
 
   async saveSettings(): Promise<void> {

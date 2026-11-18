@@ -27,6 +27,7 @@ export function commentTokensAt(doc: Text, pos: number): CommentTokens {
   let inside = false;
   for (let i = 1; i <= lineNo; i++) {
     const text = doc.line(i).text;
+    if (!text.includes("```") && !text.includes("~~~")) continue;
     const m = /^\s*(```+|~~~+)\s*([\w+#-]*)/.exec(text);
     if (!m) continue;
     if (!inside) {

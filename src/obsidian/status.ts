@@ -133,8 +133,21 @@ function inks(style: CSSStyleDeclaration): Record<string, string> {
   return props;
 }
 
-export function renderStatus(el: HTMLElement, editor: HelixEditor, host: Host, view: MarkdownView | null): void {
+const rendered = new WeakMap<HTMLElement, string>();
+
+export function forgetStatus(el: HTMLElement): void {
+  rendered.delete(el);
+}
+
+export function renderStatus(el: HTMLElement, editor: HelixEditor, host: Host, view: MarkdownView | null, force = false): void {
   const sl = editor.config.statusline;
+  const pending = (editor.count !== null ? String(editor.count) : "") + editor.pendingDisplay();
+  const macro = editor.macroRecording ? `[${editor.macroRecording.register}]` : "";
+  const sides: [string, string[]][] = [["left", sl.left], ["center", sl.center], ["right", sl.right]];
+  const groups = sides.map(([side, names]) => [side, names.map((name) => (name === "spacer" ? null : trim(element(name, editor, host, view))))] as const);
+  const signature = JSON.stringify([pending, macro, groups]);
+  if (!force && rendered.get(el) === signature) return;
+  rendered.delete(el);
   const bar = el.parentElement;
   const squared = el.querySelector(":scope > .hx-status-strip:not(.hx-hidden)") !== null;
   if (bar) {
@@ -155,21 +168,18 @@ export function renderStatus(el: HTMLElement, editor: HelixEditor, host: Host, v
   }
   el.empty();
   const strip = el.createDiv({ cls: "hx-status-strip" });
-  const pending = (editor.count !== null ? String(editor.count) : "") + editor.pendingDisplay();
   if (pending) strip.createSpan({ text: pending, cls: "status-bar-item hx-status-pending" });
-  if (editor.macroRecording) strip.createSpan({ text: `[${editor.macroRecording.register}]`, cls: "status-bar-item hx-status-macro" });
+  if (macro) strip.createSpan({ text: macro, cls: "status-bar-item hx-status-macro" });
   strip.toggleClass("hx-hidden", strip.childElementCount === 0);
   el.toggleClass("hx-status-strip-shown", !strip.hasClass("hx-hidden") && !el.hasClass("hx-status-full"));
-  const groups: [string, string[]][] = [["left", sl.left], ["center", sl.center], ["right", sl.right]];
-  for (const [side, group] of groups) {
+  for (const [side, items] of groups) {
     const box = el.createSpan({ cls: `hx-status-group hx-status-${side}` });
     if (side === "right" && el.hasClass("hx-status-full") && !strip.hasClass("hx-hidden")) box.appendChild(strip);
-    for (const name of group) {
-      if (name === "spacer") {
+    for (const parts of items) {
+      if (parts === null) {
         box.createSpan({ cls: "hx-status-item" });
         continue;
       }
-      const parts = trim(element(name, editor, host, view));
       if (parts.length === 0) continue;
       const coloredMode = parts.some((part) => part.cls?.includes("hx-color"));
       const item = box.createSpan({ cls: `status-bar-item hx-status-item${coloredMode ? " hx-status-item-mode" : ""}` });
@@ -177,6 +187,7 @@ export function renderStatus(el: HTMLElement, editor: HelixEditor, host: Host, v
     }
   }
   bar?.toggleClass("hx-bar-square", el.hasClass("hx-status-strip-shown"));
+  rendered.set(el, signature);
 }
 
 export function releaseBar(el: HTMLElement): void {

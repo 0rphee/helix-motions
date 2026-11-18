@@ -46,6 +46,21 @@ interface TableWidget {
   pasteSelection(event: { clipboardData: { getData(type: string): string } }): boolean;
 }
 
+type Offsets = ReturnType<TableCell["getAbsoluteOffsets"]>;
+type OffsetsOf = (cell: TableCell) => Offsets;
+
+function memoOffsets(): OffsetsOf {
+  const known = new Map<TableCell, Offsets>();
+  return (cell) => {
+    let offsets = known.get(cell);
+    if (!offsets) {
+      offsets = cell.getAbsoluteOffsets();
+      known.set(cell, offsets);
+    }
+    return offsets;
+  };
+}
+
 interface ActiveCell {
   table: TableWidget;
   cell: TableCell;
@@ -108,14 +123,24 @@ function isLivePreview(view: EditorView): boolean {
   return view.state.field(editorLivePreviewField, false) === true;
 }
 
+const frontmatterEnds = new WeakMap<Text, number | null>();
+
 function frontmatterEnd(view: EditorView): number | null {
   const doc = view.state.doc;
-  if (doc.lines < 2 || doc.line(1).text !== "---") return null;
-  for (let n = 2; n <= doc.lines; n++) {
-    const line = doc.line(n);
-    if (line.text === "---" || line.text === "...") return Math.min(line.to + 1, doc.length);
+  const known = frontmatterEnds.get(doc);
+  if (known !== undefined) return known;
+  let end: number | null = null;
+  if (doc.lines >= 2 && doc.line(1).text === "---") {
+    for (let n = 2; n <= doc.lines; n++) {
+      const line = doc.line(n);
+      if (line.text === "---" || line.text === "...") {
+        end = Math.min(line.to + 1, doc.length);
+        break;
+      }
+    }
   }
-  return null;
+  frontmatterEnds.set(doc, end);
+  return end;
 }
 
 function propertiesHidden(plugin: HookPlugin, view: EditorView): boolean {
@@ -135,8 +160,7 @@ function tableWidgets(view: EditorView): TableWidget[] {
 
 function embedRanges(view: EditorView): MotionRange[] {
   const out: MotionRange[] = [];
-  for (const el of Array.from(view.contentDOM.children)) {
-    if (el.classList.contains("cm-table-widget") || !(el.classList.contains("cm-embed-block") || el.classList.contains("internal-embed"))) continue;
+  for (const el of Array.from(view.contentDOM.querySelectorAll(":scope > .cm-embed-block:not(.cm-table-widget), :scope > .internal-embed:not(.cm-table-widget)"))) {
     const length = (el as unknown as { cmTile?: { length?: number } }).cmTile?.length;
     if (length === undefined) continue;
     const from = view.posAtDOM(el);
@@ -768,12 +792,13 @@ function followIntoCell(plugin: HookPlugin, view: EditorView): void {
   const { from, to } = native.main;
   const table = tableWidgets(view).find((t) => from >= t.start && to <= t.end);
   if (!table) return;
+  const offsetsOf = memoOffsets();
   const cell = table.rows.flat().find((c) => {
-    const offsets = c.getAbsoluteOffsets();
+    const offsets = offsetsOf(c);
     return from >= offsets.textStart && to <= offsets.textEnd;
   });
   if (!cell) return;
-  const start = cell.getAbsoluteOffsets().textStart;
+  const start = offsetsOf(cell).textStart;
   const changes = cellChanges(cell.text);
   const asked = inCell(changes, cell.text.length, from - start, to - start);
   const md = activeView(plugin.app);
@@ -821,39 +846,58 @@ function paintMainRanges(plugin: HookPlugin, view: EditorView): void {
     const root = table.containerEl;
     const cells: PaintCell[] = [];
     if (several && !tableCursors && focused !== table) {
-      for (const cell of table.rows.flat()) {
-        const { start, end, textStart, textEnd } = cell.getAbsoluteOffsets();
-        const ranges: PaintCell["ranges"] = [];
-        value.selection.ranges.forEach((range, i) => {
-          const first = doc.lineAt(range.from());
-          const whole = range.from() <= first.from && range.to() >= doc.lineAt(Math.max(range.to() - 1, range.from())).to;
-          if (range.from() < table.start || range.to() > table.end + (whole ? 1 : 0)) return;
-          const primary = i === value.selection.primaryIndex;
-          const part = rangeParts(doc, range, primary, insert, shape);
-          if (whole) {
-            const row = table.rows.find((r) => r[0] && doc.lineAt(r[0].getAbsoluteOffsets().textStart).number === doc.lineAt(part.pos).number);
-            const edge = row && part.pos >= row[row.length - 1]!.getAbsoluteOffsets().end ? row[row.length - 1] : row?.[0];
-            if (edge !== cell) return;
-            const length = textEnd - textStart;
-            const atEnd = edge === row![row!.length - 1] && part.pos >= end;
-            ranges.push({ from: 0, to: 0, pos: atEnd ? length : 0, end: atEnd ? length : Math.min(1, length), eol: atEnd || length === 0, primary });
-            return;
+      const offsetsOf = memoOffsets();
+      let rowByLine: Map<number, TableCell[]> | null = null;
+      const rowAt = (number: number) => {
+        if (!rowByLine) {
+          rowByLine = new Map();
+          for (const r of table.rows) {
+            if (!r[0]) continue;
+            const key = doc.lineAt(offsetsOf(r[0]).textStart).number;
+            if (!rowByLine.has(key)) rowByLine.set(key, r);
           }
-          const from = Math.max(part.from, textStart);
-          const to = Math.min(part.to, textEnd);
-          const holdsCursor = part.pos >= start && part.pos < end;
-          if (to <= from && !holdsCursor) return;
-          const cursor = Math.max(Math.min(part.pos, textEnd), textStart);
-          ranges.push({
-            from: from - textStart,
-            to: Math.max(to, from) - textStart,
-            pos: holdsCursor ? cursor - textStart : -1,
-            end: holdsCursor ? Math.max(Math.min(part.end, textEnd), cursor) - textStart : -1,
-            eol: part.pos >= textEnd,
-            primary,
-          });
-        });
-        if (ranges.length > 0) cells.push({ content: cell.contentEl ?? cell.el, source: doc.sliceString(textStart, textEnd), ranges });
+        }
+        return rowByLine.get(number);
+      };
+      const inside: { whole: boolean; primary: boolean; part: ReturnType<typeof rangeParts>; row: TableCell[] | undefined; edge: TableCell | undefined }[] = [];
+      value.selection.ranges.forEach((range, i) => {
+        const first = doc.lineAt(range.from());
+        const whole = range.from() <= first.from && range.to() >= doc.lineAt(Math.max(range.to() - 1, range.from())).to;
+        if (range.from() < table.start || range.to() > table.end + (whole ? 1 : 0)) return;
+        const primary = i === value.selection.primaryIndex;
+        const part = rangeParts(doc, range, primary, insert, shape);
+        const row = whole ? rowAt(doc.lineAt(part.pos).number) : undefined;
+        const edge = row && part.pos >= offsetsOf(row[row.length - 1]!).end ? row[row.length - 1] : row?.[0];
+        inside.push({ whole, primary, part, row, edge });
+      });
+      if (inside.length > 0) {
+        for (const cell of table.rows.flat()) {
+          const { start, end, textStart, textEnd } = offsetsOf(cell);
+          const ranges: PaintCell["ranges"] = [];
+          for (const { whole, primary, part, row, edge } of inside) {
+            if (whole) {
+              if (edge !== cell) continue;
+              const length = textEnd - textStart;
+              const atEnd = edge === row![row!.length - 1] && part.pos >= end;
+              ranges.push({ from: 0, to: 0, pos: atEnd ? length : 0, end: atEnd ? length : Math.min(1, length), eol: atEnd || length === 0, primary });
+              continue;
+            }
+            const from = Math.max(part.from, textStart);
+            const to = Math.min(part.to, textEnd);
+            const holdsCursor = part.pos >= start && part.pos < end;
+            if (to <= from && !holdsCursor) continue;
+            const cursor = Math.max(Math.min(part.pos, textEnd), textStart);
+            ranges.push({
+              from: from - textStart,
+              to: Math.max(to, from) - textStart,
+              pos: holdsCursor ? cursor - textStart : -1,
+              end: holdsCursor ? Math.max(Math.min(part.end, textEnd), cursor) - textStart : -1,
+              eol: part.pos >= textEnd,
+              primary,
+            });
+          }
+          if (ranges.length > 0) cells.push({ content: cell.contentEl ?? cell.el, source: doc.sliceString(textStart, textEnd), ranges });
+        }
       }
     }
     let layers = painted.get(root);
@@ -907,30 +951,30 @@ const ROW_COPIES: Record<string, number> = { copy_selection_on_next_line: 1, cop
 const ROW_CHANGES = new Set(["open_below", "open_above", "join_selections", "join_selections_space", "add_newline_above", "add_newline_below", "indent", "unindent"]);
 const LINE_INSERTS: Record<string, string> = { insert_at_line_start: "goto_first_nonwhitespace", insert_at_line_end: "goto_line_end_newline" };
 
-function holdingCell(tables: TableWidget[], range: Range): { table: TableWidget; cell: TableCell } | null {
+function holdingCell(tables: TableWidget[], range: Range, offsetsOf: OffsetsOf): { table: TableWidget; cell: TableCell } | null {
   for (const table of tables) {
     if (range.from() < table.start || range.from() > table.end) continue;
     for (const cell of table.rows.flat()) {
-      const { start, end } = cell.getAbsoluteOffsets();
+      const { start, end } = offsetsOf(cell);
       if (range.from() >= start && range.to() <= end) return { table, cell };
     }
   }
   return null;
 }
 
-function cellEnd(cell: TableCell, forward: boolean): Range {
-  const { textStart, textEnd } = cell.getAbsoluteOffsets();
+function cellEnd(cell: TableCell, forward: boolean, offsetsOf: OffsetsOf): Range {
+  const { textStart, textEnd } = offsetsOf(cell);
   return forward || textEnd === textStart ? new Range(textStart, textStart + 1) : new Range(textEnd - 1, textEnd);
 }
 
-function snapIntoCell(tables: TableWidget[], moved: Range, forward: boolean, doc: EditorState["doc"]): Range {
+function snapIntoCell(tables: TableWidget[], moved: Range, forward: boolean, doc: EditorState["doc"], offsetsOf: OffsetsOf): Range {
   const pos = moved.cursor(doc);
   const table = tables.find((t) => pos >= t.start && pos <= t.end);
   if (!table) return moved;
   const cells = table.rows.flat();
-  if (cells.some((c) => pos >= c.getAbsoluteOffsets().start && pos < c.getAbsoluteOffsets().end)) return moved;
-  const next = forward ? cells.find((c) => c.getAbsoluteOffsets().textStart >= pos) : [...cells].reverse().find((c) => c.getAbsoluteOffsets().textEnd <= pos);
-  return next ? cellEnd(next, forward) : moved;
+  if (cells.some((c) => pos >= offsetsOf(c).start && pos < offsetsOf(c).end)) return moved;
+  const next = forward ? cells.find((c) => offsetsOf(c).textStart >= pos) : cells.findLast((c) => offsetsOf(c).textEnd <= pos);
+  return next ? cellEnd(next, forward, offsetsOf) : moved;
 }
 
 function shadowHost(text: string, value: { mode: Mode }, selection: Selection, view: EditorView | null): HeadlessHost {
@@ -940,20 +984,20 @@ function shadowHost(text: string, value: { mode: Mode }, selection: Selection, v
   return shadow;
 }
 
-function sameColumn(table: TableWidget, cell: TableCell, row: number, range: Range): Range | null {
+function sameColumn(table: TableWidget, cell: TableCell, row: number, range: Range, offsetsOf: OffsetsOf): Range | null {
   const target = table.rows[row]?.[Math.min(cell.col, (table.rows[row]?.length ?? 1) - 1)];
   if (!target) return null;
-  const from = cell.getAbsoluteOffsets().textStart;
-  const { textStart, textEnd } = target.getAbsoluteOffsets();
+  const from = offsetsOf(cell).textStart;
+  const { textStart, textEnd } = offsetsOf(target);
   const put = (at: number) => Math.min(textStart + at - from, textEnd);
   const anchor = put(range.anchor);
   const head = put(range.head);
   return anchor === head ? new Range(anchor, anchor + 1) : new Range(anchor, head);
 }
 
-function runInCell(plugin: HookPlugin, cx: Context, held: { table: TableWidget; cell: TableCell }, range: Range, name: string, count: number | null, key: string | null): Range[] {
+function runInCell(plugin: HookPlugin, cx: Context, held: { table: TableWidget; cell: TableCell }, range: Range, name: string, count: number | null, key: string | null, offsetsOf: OffsetsOf): Range[] {
   const { table, cell } = held;
-  const { textStart, textEnd } = cell.getAbsoluteOffsets();
+  const { textStart, textEnd } = offsetsOf(cell);
   const state = table.editor.cm.state;
   const text = state.sliceDoc(textStart, textEnd);
   const local = new Range(Math.max(Math.min(range.anchor - textStart, text.length), 0), Math.max(Math.min(range.head - textStart, text.length), 0));
@@ -963,13 +1007,13 @@ function runInCell(plugin: HookPlugin, cx: Context, held: { table: TableWidget; 
     if (isStuck(text, local, moved[0] ?? local, forward)) {
       const place = cellNeighbor(table.rows, cell, forward, name.includes("word"));
       const target = place ? table.getCellAt(place.row, place.col) : null;
-      return [target ? cellEnd(target, forward) : range];
+      return [target ? cellEnd(target, forward, offsetsOf) : range];
     }
   }
   return moved.map((r) => new Range(r.anchor + textStart, r.head + textStart));
 }
 
-function moveCellRanges(plugin: HookPlugin, cx: Context, tables: TableWidget[], name: string, key: string | null): void {
+function moveCellRanges(plugin: HookPlugin, cx: Context, tables: TableWidget[], name: string, key: string | null, offsetsOf: OffsetsOf): void {
   const view = cx.host.view!;
   const doc = view.state.doc;
   const value = view.state.field(helixField);
@@ -985,13 +1029,13 @@ function moveCellRanges(plugin: HookPlugin, cx: Context, tables: TableWidget[], 
     let primary = 0;
     selection.ranges.forEach((range, i) => {
       if (i === selection.primaryIndex) primary = out.length;
-      const held = holdingCell(tables, range);
+      const held = holdingCell(tables, range, offsetsOf);
       if (held && name in VERTICAL) {
-        out.push(sameColumn(held.table, held.cell, held.cell.row + VERTICAL[name]! * cx.count(), range) ?? range);
+        out.push(sameColumn(held.table, held.cell, held.cell.row + VERTICAL[name]! * cx.count(), range, offsetsOf) ?? range);
         return;
       }
       if (held && copy !== undefined) {
-        const added = sameColumn(held.table, held.cell, held.cell.row + copy * cx.count(), range);
+        const added = sameColumn(held.table, held.cell, held.cell.row + copy * cx.count(), range, offsetsOf);
         out.push(range);
         if (added) {
           if (i === selection.primaryIndex) primary = out.length;
@@ -1000,7 +1044,7 @@ function moveCellRanges(plugin: HookPlugin, cx: Context, tables: TableWidget[], 
         return;
       }
       if (held) {
-        out.push(...runInCell(plugin, cx, held, range, name, count, key));
+        out.push(...runInCell(plugin, cx, held, range, name, count, key, offsetsOf));
         return;
       }
       noteShadow ??= shadowHost(doc.toString(), value, new Selection([range], 0), view);
@@ -1009,7 +1053,7 @@ function moveCellRanges(plugin: HookPlugin, cx: Context, tables: TableWidget[], 
       const inner = new Context(plugin.helix, shadow, count, cx.register);
       plugin.helix.runStatic(inner, name);
       if (key !== null) inner.onNextKeyCallback?.cb(inner, key);
-      for (const moved of shadow.state.field(helixField).selection.ranges) out.push(name.startsWith("extend") ? moved : snapIntoCell(tables, moved, forward, doc));
+      for (const moved of shadow.state.field(helixField).selection.ranges) out.push(name.startsWith("extend") ? moved : snapIntoCell(tables, moved, forward, doc, offsetsOf));
     });
     selection = new Selection(out, primary);
   }
@@ -1021,23 +1065,24 @@ function noteCellsCommand(plugin: HookPlugin, name: string, cx: Context): boolea
   const value = view?.state.field(helixField, false);
   if (!view || !value || value.mode === "insert" || plugin.helix.activePrompt || value.selection.ranges.length < 2) return false;
   const tables = tableWidgets(view);
-  if (!value.selection.ranges.some((r) => holdingCell(tables, r))) return false;
+  const offsetsOf = memoOffsets();
+  if (!value.selection.ranges.some((r) => holdingCell(tables, r, offsetsOf))) return false;
   if (ROW_CHANGES.has(name)) {
     plugin.helix.setStatus("that would change the table's rows");
     return true;
   }
   const lineInsert = LINE_INSERTS[name];
   if (lineInsert) {
-    moveCellRanges(plugin, cx, tables, lineInsert, null);
+    moveCellRanges(plugin, cx, tables, lineInsert, null, offsetsOf);
     plugin.helix.runStatic(new Context(plugin.helix, cx.host, null, null), "insert_mode");
     return true;
   }
   if (NEXT_KEY_COMMANDS.has(name)) {
-    cx.onNextKey((inner, key) => moveCellRanges(plugin, inner, tables, name, plugin.helix.keyChar(key) ?? key));
+    cx.onNextKey((inner, key) => moveCellRanges(plugin, inner, tables, name, plugin.helix.keyChar(key) ?? key, memoOffsets()));
     return true;
   }
   if (!runsOnCellText(name) && ROW_COPIES[name] === undefined) return false;
-  moveCellRanges(plugin, cx, tables, name, null);
+  moveCellRanges(plugin, cx, tables, name, null, offsetsOf);
   return true;
 }
 
@@ -1054,11 +1099,15 @@ function guardTableEdits(plugin: HookPlugin): Extension {
     let refused = false;
     const escapes: number[] = [];
     const doc = tr.startState.doc;
+    const offsetsOf = memoOffsets();
+    const flat = new Map<TableWidget, TableCell[]>();
     tr.changes.iterChanges((fromA, toA, fromB, _toB, inserted) => {
       const table = tables.find((t) => fromA <= t.end && toA >= t.start);
       if (!table) return;
-      const cell = table.rows.flat().find((c) => {
-        const { start, end } = c.getAbsoluteOffsets();
+      let cells = flat.get(table);
+      if (!cells) flat.set(table, (cells = table.rows.flat()));
+      const cell = cells.find((c) => {
+        const { start, end } = offsetsOf(c);
         return fromA >= start && toA <= end;
       });
       const text = inserted.toString();
