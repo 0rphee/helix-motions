@@ -1,5 +1,5 @@
 import { editorLivePreviewField, MarkdownView, type App } from "obsidian";
-import { EditorSelection, EditorState, type Extension, Text } from "@codemirror/state";
+import { ChangeSet, EditorSelection, EditorState, type Extension, type SelectionRange, Text } from "@codemirror/state";
 import { EditorView, type ViewUpdate } from "@codemirror/view";
 import { commitHistoryNow, Context, HeadlessHost, type HelixEdge, type HelixEditor, helixField, historyField, hostHooks, type Host, type Mode, type MotionRange, pasteImpl, pushJump, Range, rangeParts, Selection, selOf, setMode, setSel, syncNativeSelection } from "helix-cm6/engine";
 import { whileMovingToCell } from "./selection-snap";
@@ -8,6 +8,7 @@ import { CellCursors, cellNeighbor, CROSS_LEFT, CROSS_RIGHT, type CursorEnv, isS
 
 let tableCursors: CellCursors | null = null;
 let walking = false;
+let following = false;
 
 interface TableCell {
   row: number;
@@ -737,10 +738,33 @@ function leaveCellWithNote(plugin: HookPlugin, view: EditorView): void {
   if (from < active.table.start || to > active.table.end) view.focus();
 }
 
+function cellChanges(text: string): ChangeSet {
+  const changes: { from: number; to: number; insert: string }[] = [];
+  const code = Array.from(text.matchAll(/(`+)[^`]+\1/g));
+  for (const match of text.matchAll(/(\\+\||<br>)/gi)) {
+    const found = match[1]!;
+    const pipe = found.toLowerCase() !== "<br>";
+    let from = match.index;
+    let length = found.length;
+    if (pipe) {
+      if ((length - 1) % 2 === 0) continue;
+      from += length - 2;
+      length = 2;
+    } else if (code.some((span) => span.index < from && span.index + span[0].length > from + length)) continue;
+    changes.push({ from, to: from + length, insert: pipe ? "|" : "\n" });
+  }
+  return ChangeSet.of(changes, text.length);
+}
+
+function inCell(changes: ChangeSet, length: number, anchor: number, head: number): SelectionRange {
+  const fit = (at: number) => Math.min(Math.max(at, 0), length);
+  return EditorSelection.single(fit(anchor), fit(head)).map(changes).main;
+}
+
 function followIntoCell(plugin: HookPlugin, view: EditorView): void {
   const value = view.state.field(helixField, false);
   const native = view.state.selection;
-  if (!value || tableCursors || native.ranges.length !== 1 || native.main.empty) return;
+  if (!value || following || tableCursors || native.ranges.length !== 1 || native.main.empty) return;
   const { from, to } = native.main;
   const table = tableWidgets(view).find((t) => from >= t.start && to <= t.end);
   if (!table) return;
@@ -750,18 +774,26 @@ function followIntoCell(plugin: HookPlugin, view: EditorView): void {
   });
   if (!cell) return;
   const start = cell.getAbsoluteOffsets().textStart;
+  const changes = cellChanges(cell.text);
+  const asked = inCell(changes, cell.text.length, from - start, to - start);
   const md = activeView(plugin.app);
   const active = md ? componentOf(md).tableCell : null;
   if (active?.editor.cm.state.field(helixField, false)?.mode === "insert") return;
   if (active?.cell === cell) {
     const own = active.editor.cm.state.selection.main;
-    if (own.from + start === from && own.to + start === to) return;
+    if (own.from === asked.from && own.to === asked.to) return;
   }
-  whileMovingToCell(() => table.setCellFocus(cell.row, cell.col, () => EditorSelection.single(from - start, to - start)));
-  const now = md ? componentOf(md).tableCell : null;
-  if (!now || now.cell.row !== cell.row || now.cell.col !== cell.col) return;
-  const primary = value.selection.primary();
-  setMode(plugin.hostForView(now.editor.cm), value.mode, new Selection([new Range(primary.anchor - start, primary.head - start)], 0));
+  following = true;
+  try {
+    whileMovingToCell(() => table.setCellFocus(cell.row, cell.col, () => EditorSelection.single(asked.anchor, asked.head)));
+    const now = md ? componentOf(md).tableCell : null;
+    if (!now || now.cell.row !== cell.row || now.cell.col !== cell.col) return;
+    const primary = value.selection.primary();
+    const kept = inCell(changes, cell.text.length, primary.anchor - start, primary.head - start);
+    setMode(plugin.hostForView(now.editor.cm), value.mode, new Selection([new Range(kept.anchor, kept.head)], 0));
+  } finally {
+    following = false;
+  }
 }
 
 const paintedTables = new WeakMap<EditorView, Map<HTMLElement, CellLayers>>();

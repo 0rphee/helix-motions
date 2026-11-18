@@ -43,6 +43,8 @@ On any transaction in the main editor, the widget's `receiveSelection` refocuses
 
 `selectCells(anchor, head)` ignores `anchor === head`. For a one-cell selection, pass an object made with `Object.create(cell)` as the anchor: bounds read only its `row` and `col`. `deleteSelection` removes whole rows, columns or the table, and clears anything else. Only the focused cell has an editor, and the others show rendered text, so cursors in several cells run in a headless Helix host with one line per cell (`src/obsidian/table-cursors.ts`), and each change is written with `updateCell` and `dispatchTable`.
 
+A cell editor shows `\|` as `|` and `<br>` as a line break, so an offset in the note and an offset in the cell differ after the first of them. `cellChanges` in `src/obsidian/hooks.ts` repeats Obsidian's rule, and `followIntoCell` maps every offset through it. A selection written into a cell without Obsidian's `po` annotation is copied back to the note at once, so code that writes into a cell from a note update must not run again inside its own write; `following` stops that.
+
 A cell editor's update copies its old position back over the note's selection. So when the note's selection leaves the table, for example by a click in another pane, focus goes to the note at once.
 
 ## Layout after a reveal

@@ -64,6 +64,31 @@ function inTable(): void {
   tableKeys("jj");
 }
 
+function dispatches(run: () => void): number {
+  evalJs(`JSON.stringify((()=>{const p=Object.getPrototypeOf(app.workspace.activeLeaf.view.editor.cm);p.__dispatch=p.dispatch;window.__dispatches=0;p.dispatch=function(...a){window.__dispatches++;if(window.__dispatches<=200)return p.__dispatch.apply(this,a)};return true})())`);
+  let count = 0;
+  try {
+    run();
+  } finally {
+    count = evalJs<number>(`JSON.stringify((()=>{const p=Object.getPrototypeOf(app.workspace.activeLeaf.view.editor.cm);p.dispatch=p.__dispatch;delete p.__dispatch;return window.__dispatches})())`);
+  }
+  return count;
+}
+
+function cellMatchesNote(): void {
+  const [inCell, inNote] = evalJs<[string, string]>(`JSON.stringify((()=>{const v=app.workspace.activeLeaf.view;const c=v.editor.editorComponent.tableCell.editor.cm;const s=c.state.selection.main;const m=v.editor.cm.state.selection.main;return [c.state.sliceDoc(s.from,s.to),v.editor.cm.state.sliceDoc(m.from,m.to)]})())`);
+  if (inCell !== "") expectEq("the note selection is the cell selection", inNote, inCell.replace(/\|/g, "\\|").replace(/\n/g, "<br>"));
+}
+
+function doubleClickCell(row: number, col: number): void {
+  const [x, y] = evalJs<[number, number]>(`JSON.stringify((()=>{const b=document.querySelector(".cm-table-widget").cmTile.widget.rows[${row}][${col}].el.getBoundingClientRect();return [b.left+b.width/2,b.top+b.height/2]})())`);
+  for (const clickCount of [1, 2]) {
+    mouse("mousePressed", x, y, { clickCount });
+    mouse("mouseReleased", x, y, { clickCount });
+  }
+  Bun.sleepSync(400);
+}
+
 function tableScenarios(): Check[] {
   return [
     {
@@ -301,6 +326,34 @@ function tableScenarios(): Check[] {
         expectEq("undone", note().includes("Zh1"), false);
         tableKeys("U");
         expectEq("redone", note().includes("Zh1"), true);
+      },
+    },
+    {
+      name: "table: a cell with \\| and <br> keeps the cursor on the text, also on a double click and when typing",
+      run: () => {
+        setDoc("#[a|]#bove\n\n| h1 | h2 |\n| -- | -- |\n| a\\|b<br>c\\|dddddddddd | x |\n\nbelow\n");
+        Bun.sleepSync(500);
+        tableKeys("jjj");
+        expectEq("the cell shows | and a line break", cell(), [1, 0, "a|b\nc|dddddddddd"]);
+        tableKeys("gh");
+        const walking = dispatches(() => {
+          for (let i = 0; i < 6; i++) {
+            tableKeys("l");
+            cellMatchesNote();
+          }
+        });
+        expectTrue("walking across \\| and <br> sends a few updates at most", walking <= 20, `(${walking} updates)`);
+        const clicking = dispatches(() => {
+          doubleClickCell(1, 1);
+          doubleClickCell(1, 0);
+          cellMatchesNote();
+        });
+        expectTrue("a double click sends a few updates at most", clicking <= 30, `(${clicking} updates)`);
+        expectEq("still in the cell", cell()?.slice(0, 2), [1, 0]);
+        tableKeys("iZZZZZZZZ");
+        expectEq("every letter stays in the cell", cell()?.[2].includes("ZZZZZZZZ"), true);
+        expectEq("every letter stays in the note", note().includes("ZZZZZZZZ"), true);
+        tableKeys("<esc>");
       },
     },
     {
