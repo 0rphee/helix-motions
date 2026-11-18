@@ -1,4 +1,5 @@
-import { FileSystemAdapter, type MarkdownView } from "obsidian";
+import { FileSystemAdapter, type MarkdownView, type TFile } from "obsidian";
+import type { Text } from "@codemirror/state";
 import { type HelixEditor, helixField, type Host, nextGraphemeBoundary } from "helix-cm6/engine";
 import { tableCursorCount } from "./hooks";
 import { unresolvedIn } from "./workspace";
@@ -13,12 +14,63 @@ function severityCounts(severities: string[], warnings: number, prefix: Part[]):
   return parts.length > 0 ? [...prefix, ...parts] : [];
 }
 
+let linkVersion = 0;
+let vaultTotal: { version: number; total: number } | null = null;
+const fileTotals = new WeakMap<object, { path: string; version: number; count: number }>();
+
+export function linksChanged(): void {
+  linkVersion++;
+}
+
 function vaultWarnings(view: MarkdownView): number {
+  if (vaultTotal?.version === linkVersion) return vaultTotal.total;
   let total = 0;
   for (const links of Object.values(view.app.metadataCache.unresolvedLinks)) {
     for (const count of Object.values(links)) total += count;
   }
+  vaultTotal = { version: linkVersion, total };
   return total;
+}
+
+function fileWarnings(view: MarkdownView, file: TFile): number {
+  const cache = view.app.metadataCache.getFileCache(file);
+  if (!cache) return 0;
+  const known = fileTotals.get(cache);
+  if (known?.version === linkVersion && known.path === file.path) return known.count;
+  const count = unresolvedIn(view.app, file).length;
+  fileTotals.set(cache, { path: file.path, version: linkVersion, count });
+  return count;
+}
+
+let lastColumn: { doc: Text; cursor: number; column: number } | null = null;
+let lastLength: { doc: Text; from: number; to: number; chars: number } | null = null;
+
+function columnAt(doc: Text, lineFrom: number, cursor: number): number {
+  if (lastColumn?.doc === doc && lastColumn.cursor === cursor) return lastColumn.column;
+  const before = doc.sliceString(lineFrom, cursor);
+  let column = 0;
+  if (/^[\x20-\x7e]*$/.test(before)) column = before.length;
+  else for (let pos = lineFrom; pos < cursor; pos = nextGraphemeBoundary(doc, pos)) column++;
+  lastColumn = { doc, cursor, column };
+  return column;
+}
+
+function charsIn(doc: Text, from: number, to: number): number {
+  if (lastLength?.doc === doc && lastLength.from === from && lastLength.to === to) return lastLength.chars;
+  const text = doc.sliceString(from, to);
+  let chars = text.length;
+  for (let i = 1; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      const before = text.charCodeAt(i - 1);
+      if (before >= 0xd800 && before <= 0xdbff) {
+        chars--;
+        i++;
+      }
+    }
+  }
+  lastLength = { doc, from, to, chars };
+  return chars;
 }
 
 function element(name: string, editor: HelixEditor, host: Host, view: MarkdownView | null): Part[] {
@@ -51,7 +103,7 @@ function element(name: string, editor: HelixEditor, host: Host, view: MarkdownVi
     case "file-type":
       return [{ text: " markdown " }];
     case "diagnostics": {
-      const warnings = view?.file ? unresolvedIn(view.app, view.file).length : 0;
+      const warnings = view?.file ? fileWarnings(view, view.file) : 0;
       return severityCounts(sl.diagnostics, warnings, []);
     }
     case "workspace-diagnostics":
@@ -64,14 +116,12 @@ function element(name: string, editor: HelixEditor, host: Host, view: MarkdownVi
     }
     case "primary-selection-length": {
       const r = value.selection.primary();
-      const chars = [...doc.sliceString(r.from(), r.to())].length;
+      const chars = charsIn(doc, r.from(), r.to());
       return [{ text: ` ${chars} char${chars === 1 ? "" : "s"} ` }];
     }
     case "position": {
       const line = doc.lineAt(cursor);
-      let col = 0;
-      for (let pos = line.from; pos < cursor; pos = nextGraphemeBoundary(doc, pos)) col++;
-      return [{ text: ` ${line.number}:${col + 1} ` }];
+      return [{ text: ` ${line.number}:${columnAt(doc, line.from, cursor) + 1} ` }];
     }
     case "position-percentage":
       return [{ text: `${Math.floor((doc.lineAt(cursor).number * 100) / doc.lines)}%` }];

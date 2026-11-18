@@ -5,7 +5,7 @@ import { buildKeymaps, commitHistoryNow, dropSelectionChange, type Config, Conte
 import { runScopeHandlers } from "@codemirror/view";
 import { deleteCharBackward, insertNewlineAndIndent } from "@codemirror/commands";
 import { makeWorkspace, leafId } from "./obsidian/workspace";
-import { forgetStatus, releaseBar, renderStatus } from "./obsidian/status";
+import { forgetStatus, linksChanged, releaseBar, renderStatus } from "./obsidian/status";
 import { commentTokensAt } from "./obsidian/comments";
 import { DEFAULT_SETTINGS, HelixSettingTab, type Settings } from "./obsidian/settings";
 import { isMarkupSnap } from "./obsidian/selection-snap";
@@ -197,7 +197,12 @@ export default class HelixMotionsPlugin extends Plugin {
     );
     const workspace = this.app.workspace as unknown as { on(name: "editor-selection-change", callback: (editor: Editor) => void): EventRef };
     this.registerEvent(workspace.on("editor-selection-change", (editor) => this.countWholeFile(editor)));
-    this.registerEvent(this.app.metadataCache.on("resolved", () => this.refreshStatus()));
+    this.registerEvent(
+      this.app.metadataCache.on("resolved", () => {
+        linksChanged();
+        this.refreshStatus();
+      }),
+    );
     this.registerEvent(this.app.workspace.on("css-change", () => window.requestAnimationFrame(() => this.refreshStatus(true))));
     const onConfigFile = (file: { path: string }, oldPath?: string) => {
       if (file.path === this.configPath() || oldPath === this.configPath()) void this.reloadConfig();
@@ -466,7 +471,10 @@ export default class HelixMotionsPlugin extends Plugin {
 
   private countWholeFile(editor: Editor): void {
     const mode = (editor as unknown as { cm?: EditorView }).cm?.state.field(helixField, false)?.mode;
-    if (!mode || mode === "select" || editor.getSelection() === "") return;
+    if (!mode || mode === "select") return;
+    const from = editor.getCursor("from");
+    const to = editor.getCursor("to");
+    if (from.line === to.line && from.ch === to.ch) return;
     const plugins = (this.app as unknown as { internalPlugins?: { getEnabledPluginById(id: string): { onFileOpen?(): Promise<void> } | null } }).internalPlugins;
     void plugins?.getEnabledPluginById("word-count")?.onFileOpen?.();
   }
