@@ -634,7 +634,7 @@ function enterTable(view: EditorView, table: TableWidget, edge: HelixEdge): bool
 }
 
 export function obsidianHooks(plugin: HookPlugin): Extension {
-  return [tableMarks(plugin), guardTableEdits(plugin), hostHooks.of({
+  return [tableMarks(plugin), guardTableEdits(plugin), keepCellScroll(), hostHooks.of({
     intercept(key, host) {
       if (!tableCursors) return typeInCells(plugin, key, host);
       return tableCursors.handleKey(key, host);
@@ -736,14 +736,19 @@ export function obsidianHooks(plugin: HookPlugin): Extension {
   })];
 }
 
-function markRows(update: ViewUpdate): void {
+const markedViews = new WeakSet<EditorView>();
+
+function markRows(update: ViewUpdate, tables: () => TableWidget[]): void {
   const view = update.view;
   const doc = view.state.doc;
   const ranges = view.state.selection.ranges.filter((r) => !r.empty);
-  for (const table of tableWidgets(view)) {
+  if (ranges.length === 0 && !markedViews.has(view)) return;
+  markedViews.delete(view);
+  for (const table of tables()) {
     const covered = ranges.some((r) => r.from < table.end && r.to > table.start);
     if (!covered && !table.containerEl.classList.contains("hx-rows-selected")) continue;
     table.containerEl.classList.toggle("hx-rows-selected", covered);
+    if (covered) markedViews.add(view);
     for (const row of table.rows) {
       for (const cell of row) {
         const line = doc.lineAt(cell.getAbsoluteOffsets().textStart);
@@ -785,12 +790,12 @@ function inCell(changes: ChangeSet, length: number, anchor: number, head: number
   return EditorSelection.single(fit(anchor), fit(head)).map(changes).main;
 }
 
-function followIntoCell(plugin: HookPlugin, view: EditorView): void {
+function followIntoCell(plugin: HookPlugin, view: EditorView, tables: () => TableWidget[]): void {
   const value = view.state.field(helixField, false);
   const native = view.state.selection;
   if (!value || following || tableCursors || native.ranges.length !== 1 || native.main.empty) return;
   const { from, to } = native.main;
-  const table = tableWidgets(view).find((t) => from >= t.start && to <= t.end);
+  const table = tables().find((t) => from >= t.start && to <= t.end);
   if (!table) return;
   const offsetsOf = memoOffsets();
   const cell = table.rows.flat().find((c) => {
@@ -823,11 +828,16 @@ function followIntoCell(plugin: HookPlugin, view: EditorView): void {
 
 const paintedTables = new WeakMap<EditorView, Map<HTMLElement, CellLayers>>();
 
-function paintMainRanges(plugin: HookPlugin, view: EditorView): void {
+function paintMainRanges(plugin: HookPlugin, view: EditorView, found: () => TableWidget[] = () => tableWidgets(view)): void {
   const value = view.state.field(helixField, false);
   if (!value) return;
   let painted = paintedTables.get(view);
-  const tables = tableWidgets(view);
+  const several = value.selection.ranges.length > 1;
+  if (!several && !painted?.size) {
+    view.scrollDOM.classList.remove("hx-caret-in-cell");
+    return;
+  }
+  const tables = found();
   if (!painted) {
     if (tables.length === 0) return;
     painted = new Map();
@@ -838,7 +848,6 @@ function paintMainRanges(plugin: HookPlugin, view: EditorView): void {
   const shape = plugin.helix.config.cursorShape[value.mode];
   const md = activeView(plugin.app);
   const focused = md ? (componentOf(md).tableCell?.table ?? null) : null;
-  const several = value.selection.ranges.length > 1;
   const main = value.selection.primary();
   view.scrollDOM.classList.toggle("hx-caret-in-cell", insert && several && tables.some((t) => main.from() >= t.start && main.to() <= t.end));
   const seen = new Set<HTMLElement>();
@@ -1134,14 +1143,39 @@ function applyEscapes(update: ViewUpdate): void {
   update.view.dispatch({ changes: escapes.map((from) => ({ from, insert: "\\" })) });
 }
 
+function caretRect(view: EditorView, pos: number): DOMRect | undefined {
+  const { node, offset } = view.domAtPos(pos);
+  const caret = view.dom.ownerDocument.createRange();
+  caret.setStart(node, offset);
+  return caret.getClientRects()[0];
+}
+
+function keepCellScroll(): Extension {
+  return EditorView.scrollHandler.of((view, range, target) => {
+    const owner = tableOwner(view);
+    if (!owner || target.y !== "nearest" || target.x !== "nearest" || view.scrollDOM.scrollHeight > view.scrollDOM.clientHeight + 1) return false;
+    const margins = owner.state.facet(EditorView.scrollMargins).map((get) => get(owner));
+    const top = Math.max(target.yMargin, ...margins.map((m) => m?.top ?? 0));
+    const bottom = Math.max(target.yMargin, ...margins.map((m) => m?.bottom ?? 0));
+    const bounds = owner.scrollDOM.getBoundingClientRect();
+    return [range.head, range.anchor].every((pos) => {
+      const at = caretRect(view, pos);
+      return !!at && at.top >= bounds.top + top && at.bottom <= bounds.bottom - bottom && at.left >= bounds.left && at.right <= bounds.right;
+    });
+  });
+}
+
 function tableMarks(plugin: HookPlugin): Extension {
   return EditorView.updateListener.of((update) => {
     if (!update.selectionSet && !update.docChanged) return;
     applyEscapes(update);
-    markRows(update);
+    let found: TableWidget[] | null = null;
+    const tables = () => (found ??= tableWidgets(update.view));
+    markRows(update, tables);
     leaveCellWithNote(plugin, update.view);
-    followIntoCell(plugin, update.view);
-    paintMainRanges(plugin, update.view);
+    followIntoCell(plugin, update.view, tables);
+    found = null;
+    paintMainRanges(plugin, update.view, tables);
   });
 }
 
